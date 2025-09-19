@@ -16,9 +16,10 @@ export async function runScanner(projectPath = ".") {
   if (!Array.isArray(vulnerabilities)) {
     throw new Error("Expected snyk-report.json to contain vulnerabilities array.");
   }
-
+  // console.log('vulnerabilities', vulnerabilities);
   const seenCVEs = new Set();
   const result = [];
+  const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
 
   // Prepare text report
   const outputFile = path.join(projectPath, "epss-report.txt");
@@ -26,67 +27,113 @@ export async function runScanner(projectPath = ".") {
 
   // Fetch EPSS for each CVE
   async function fetchEPSS(cve) {
-    const url = `https://api.first.org/data/v1/epss?cve=${cve}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    return data.data[0]; // returns {cve, epss, percentile}
+    if (!cve) return null; // no CVE = no EPSS
+    try {
+      const url = `https://api.first.org/data/v1/epss?cve=${cve}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      return data.data?.[0] || null;
+    } catch (err) {
+      console.error(`❌ Failed to fetch EPSS for ${cve}:`, err.message);
+      return null;
+    }
   }
 
   let totalVulnerabilities = 0;
 
+  // classify CVSS into severity
+  function classifyCVSS(score) {
+    if (score === null || score === undefined) return null;
+    if (score >= 9.0) return "critical";
+    if (score >= 7.0) return "high";
+    if (score >= 4.0) return "medium";
+    return "low";
+  }
+
   for (const vuln of vulnerabilities) {
     const cves = vuln.identifiers?.CVE || [];
-    if (cves.length === 0) {
-      reportContent += `⚠️  No CVE found for ${vuln.moduleName}\n`;
-      result.push({
-        moduleName: vuln.moduleName,
-        title: vuln.title,
-        cve: null,
-        epss: null,
-        percentile: null,
-        cvss: vuln.cvssSources?.[0]?.baseScore || null,
-        references: vuln.references || [],
-        note: 'No CVE found'
-      });
-      continue;
-    }
+    const cvssScore = vuln.cvssSources?.[0]?.baseScore || null;
 
-    for (const cve of cves) {
-      if (seenCVEs.has(cve)) continue;
-      seenCVEs.add(cve);
+    // If no CVE → still try EPSS (will fail gracefully) then fallback to CVSS
+    const targets = cves.length > 0 ? cves : [null];
+
+
+
+    for (const cve of targets) {
+      if (cve && seenCVEs.has(cve)) continue;
+      if (cve) seenCVEs.add(cve);
       totalVulnerabilities++;
 
       const epssData = await fetchEPSS(cve);
 
-      const output = `
-Vulnerability: ${vuln.title}
-Package: ${vuln.moduleName} (${vuln.version})
-CVE: ${cve}
-EPSS Score (Probability): ${epssData?.epss || 'N/A'}
-Percentile: ${epssData?.percentile || 'N/A'}
-CVSS Score: ${vuln.cvssSources?.[0]?.baseScore || 'N/A'}
-🔗 ${vuln.references[0]?.url || 'No reference'}
-------------------------------------------------
-      `;
+      if (epssData) {
+        reportContent += `
+        Vulnerability: ${vuln.title}
+        Package: ${vuln.moduleName} (${vuln.version})
+        CVE: ${cve || "N/A"}
+        EPSS Score (Probability): ${epssData.epss}
+        Percentile: ${epssData.percentile}
+        🔗 ${vuln.references[0]?.url || 'No reference'}
+        ------------------------------------------------
+        `;
 
-      reportContent += output + '\n';
+        result.push({
+          moduleName: vuln.moduleName,
+          title: vuln.title,
+          cve,
+          epss: epssData.epss,
+          percentile: epssData.percentile,
+          cvss: null, // ignore CVSS since EPSS is available
+          severity: null,
+          references: vuln.references || [],
+          metric: "EPSS"
+        });
+      } else {
+        // No EPSS → fallback to CVSS
+        const severity = classifyCVSS(cvssScore);
+        if (severity) severityCounts[severity]++;
 
-      result.push({
-        moduleName: vuln.moduleName,
-        title: vuln.title,
-        cve,
-        epss: epssData?.epss || null,
-        percentile: epssData?.percentile || null,
-        cvss: vuln.cvssSources?.[0]?.baseScore || null,
-        references: vuln.references || []
-      });
+        reportContent += `
+        ⚠️  No EPSS found for ${cve || vuln.moduleName}, fallback to CVSS
+        Package: ${vuln.moduleName} (${vuln.version})
+        CVE: ${cve || "N/A"}
+        CVSS Score: ${cvssScore || "N/A"} → Severity: ${severity || "N/A"}
+        🔗 ${vuln.references[0]?.url || 'No reference'}
+        ------------------------------------------------
+        `;
+
+        result.push({
+          moduleName: vuln.moduleName,
+          title: vuln.title,
+          cve,
+          epss: null,
+          percentile: null,
+          cvss: cvssScore,
+          severity,
+          references: vuln.references || [],
+          metric: "CVSS"
+        });
+      }
     }
   }
 
+
   // Summary
-  const summary = `\n🔴 Total vulnerabilities found: ${totalVulnerabilities}\n`;
-  console.log(summary);
-  reportContent += summary;
+  // const summary = `\n🔴 Total vulnerabilities found: ${totalVulnerabilities}\n`;
+  // console.log(summary);
+  // reportContent += summary;
+
+  // Severity summary
+  const severitySummary = `
+  Severity counts (CVSS fallback):
+    Critical: ${severityCounts.critical}
+    High:     ${severityCounts.high}
+    Medium:   ${severityCounts.medium}
+    Low:      ${severityCounts.low}
+  `;
+  console.log(severitySummary);
+  reportContent += severitySummary;
+
 
   // Write text report
   fs.writeFileSync(outputFile, reportContent, 'utf8');
@@ -95,6 +142,7 @@ CVSS Score: ${vuln.cvssSources?.[0]?.baseScore || 'N/A'}
   // Return JSON for CLI
   return {
     totalVulnerabilities: result.length,
-    vulnerabilities: result
+    vulnerabilities: result,
+    severityCounts
   };
 }
