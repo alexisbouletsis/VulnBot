@@ -9,21 +9,22 @@ import { runComparison } from './epss-comparison.js';
 
 const CONFIG_FILE = './config.json';
 let config;
-
 if (fs.existsSync(CONFIG_FILE)) {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
 } else {
-  // fallback default config
+  const epss = 0.7;
   config = {
-    weights: { epss: 0.5, snyk: 0.5 },
+    weights: { epss, snyk: 1 - epss },
     thresholds: {
       avgThreshold: 0.05,
       criticalThreshold: 0.3,
-      highCVSS: 7,
-      critical: null,
-      high: null,
-      medium: null,
-      low: null
+      cvssCutoff: 7,
+      severityCounts: {
+        critical: 1,
+        high: 2,
+        medium: 5,
+        low: null
+      }
     }
   };
 }
@@ -53,22 +54,38 @@ async function main() {
 // --- Configure thresholds & weights ---
 async function configure() {
   const answers = await inquirer.prompt([
-    { type: 'input', name: 'epssWeight', message: 'EPSS weight:', default: config.weights.epss },
-    { type: 'input', name: 'snykWeight', message: 'Snyk weight:', default: config.weights.snyk },
-    { type: 'input', name: 'cutoff', message: 'EPSS cutoff:', default: config.thresholds.avgThreshold },
-    { type: 'input', name: 'critical', message: 'EPSS threshold Critical:', default: config.thresholds.criticalThreshold },
-    // { type: 'input', name: 'high', message: 'EPSS threshold High:', default: config.thresholds.high },
-    // { type: 'input', name: 'medium', message: 'EPSS threshold Medium:', default: config.thresholds.medium },
-    // { type: 'input', name: 'low', message: 'EPSS threshold Low:', default: config.thresholds.low }
+    {
+      type: 'input', name: 'epssWeight', message: 'EPSS weight (0-1):', default: config.weights.epss, validate: (value) => {
+        const num = parseFloat(value);
+        if (isNaN(num) || num < 0 || num > 1) {
+          return "Please enter a number between 0 and 1";
+        }
+        return true;
+      }
+    },
+    // { type: 'input', name: 'snykWeight', message: 'Snyk weight:', default: config.weights.snyk },
+    { type: 'input', name: 'epssCutoff', message: 'EPSS cutoff (0-1):', default: config.thresholds.avgThreshold },
+    { type: 'input', name: 'epssCritical', message: 'EPSS Critical (0-1):', default: config.thresholds.criticalThreshold },
+    { type: 'input', name: 'cvssCutoff', message: 'CVSS cutoff (0-10):', default: config.thresholds.cvssCutoff },
+    { type: 'input', name: 'nOfCriticals', message: 'Count of critical severities', default: config.thresholds.severityCounts.critical },
+    { type: 'input', name: 'nOfHighs', message: 'Count of high severities', default: config.thresholds.severityCounts.high },
+    { type: 'input', name: 'nOfMediums', message: 'Count of medium severities', default: config.thresholds.severityCounts.medium },
+    { type: 'input', name: 'nOfLows', message: 'Count of low severities', default: config.thresholds.severityCounts.low },
   ]);
 
-  config.weights.epss = parseFloat(answers.epssWeight);
-  config.weights.snyk = parseFloat(answers.snykWeight);
-  config.thresholds.avgThreshold = parseFloat(answers.cutoff);
-  config.thresholds.criticalThreshold = parseFloat(answers.critical);
-  // config.thresholds.high = parseFloat(answers.high);
-  // config.thresholds.medium = parseFloat(answers.medium);
-  // config.thresholds.low = parseFloat(answers.low);
+  const epssWeight = parseFloat(answers.epssWeight);
+  const snykWeight = 1 - epssWeight;
+
+
+  config.weights.epss = epssWeight;
+  config.weights.snyk = snykWeight
+  config.thresholds.avgThreshold = parseFloat(answers.epssCutoff);
+  config.thresholds.criticalThreshold = parseFloat(answers.epssCritical);
+  config.thresholds.cvssCutoff = parseFloat(answers.cvssCutoff);
+  config.thresholds.severityCounts.critical = parseFloat(answers.nOfCriticals);
+  config.thresholds.severityCounts.high = parseFloat(answers.nOfHighs);
+  config.thresholds.severityCounts.medium = parseFloat(answers.nOfMediums);
+  config.thresholds.severityCounts.low = parseFloat(answers.nOfLows);
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
   console.log(chalk.green("✅ Configuration saved!"));
@@ -84,13 +101,14 @@ async function runReview() {
 
   console.log(chalk.yellow("Running scanner..."));
   const scanResult = await runScanner(path);
-  console.log(chalk.gray(`Found ${scanResult.totalVulnerabilities} vulnerabilities`));
+  console.log(chalk.yellow(`Found ${scanResult.totalVulnerabilities} vulnerabilities`));
 
   console.log(chalk.yellow("Comparing vulnerabilities..."));
   const { decision, reason, avgScore } = await runComparison(
     "snyk-report.json",
     "epss-report.txt",
-    "epss-plain-table.txt"
+    "epss-plain-table.txt",
+    config
   );
 
   // --- Final decision print ---
@@ -102,41 +120,8 @@ async function runReview() {
     console.log(chalk.red(`Reason: ${reason}`));
   }
   console.log(chalk.yellow(`Average Score: ${avgScore.toFixed(6)}`));
-
   console.log(chalk.green("✅ Comparison complete. See epss-plain-table.txt for details."));
 
-  // --- Ask LLM for explanation & advice ---
-  if (apiKey) {
-    console.log(chalk.yellow("\n🤖 Asking AI for explanation..."));
-    try {
-      const response = await client.chat.completions.create({
-        model: "gpt-4o-mini", // cheaper, faster model
-        messages: [
-          {
-            role: "system",
-            content: "You are a helpful security reviewer. Explain scan results simply and suggest next steps.",
-          },
-          {
-            role: "user",
-            content: `Here is the decision from my scanner:
-Decision: ${decision}
-Reason: ${reason || "None"}
-Average Score: ${avgScore.toFixed(6)}
-
-Please explain this decision and give advice on how to improve the code/project.`,
-          },
-        ],
-      });
-
-      console.log(chalk.cyan("\n--- AI Review Summary ---"));
-      console.log(response.choices[0].message.content);
-      console.log(chalk.cyan("--- End of AI Review ---\n"));
-    } catch (err) {
-      console.error(chalk.red("❌ Error calling OpenAI API:"), err.message);
-    }
-  } else {
-    console.log(chalk.red("⚠️ No OpenAI API key found. Skipping AI step."));
-  }
 
 }
 
