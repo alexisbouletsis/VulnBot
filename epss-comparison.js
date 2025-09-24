@@ -5,24 +5,14 @@ import path from 'path';
 export function runComparison(
   snykFile = "snyk-report.json",
   epssFile = "epss-report.txt",
-  outputFile = "epss-plain-table.txt"
+  outputFile = "epss-plain-table.txt",
+  config
 ) {
 
-  const CONFIG_FILE = './config.json';
-  let config;
+  const { epss, snyk } = config.weights;
+  const { avgThreshold, criticalThreshold, cvssCutoff } = config.thresholds;
+  const { thresholds: { severityCounts: { critical, high, medium, low } } } = config;
 
-  if (fs.existsSync(CONFIG_FILE)) {
-    config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  } else {
-    config = {
-      weights: { epss: 0.7, snyk: 0.3 },
-      thresholds: {
-        avgThreshold: 0.05,
-        criticalThreshold: 0.3,
-      }
-    };
-  }
-  const { avgThreshold, criticalThreshold } = config.thresholds;
 
 
   // --- Load Snyk report (JSON) ---
@@ -110,14 +100,12 @@ export function runComparison(
 
   // --- Decision making ---
   const avgScore = count > 0 ? totalScore / count : 0;
-  console.log('avgThreshold= ', avgThreshold);
-  console.log('criticalThreshold= ', criticalThreshold);
   let decision = "ACCEPT";
   let rejectReason = "";
 
   for (const cve of Object.keys(epssData)) {
     if (epssData[cve].epss > criticalThreshold) {
-      console.log("epssData[cve].epss= ", epssData[cve].epss);
+      // console.log("epssData[cve].epss= ", epssData[cve].epss);
       decision = "REJECT";
       rejectReason = `High EPSS CVE: ${cve}`;
       break;
@@ -130,11 +118,10 @@ export function runComparison(
   }
 
   // --- Print summary ---
-  console.log("--- SUMMARY ---");
-  console.log(`Decision: ${decision}`);
-  if (rejectReason) console.log(`Reason: ${rejectReason}`);
-  console.log(`Average score per vulnerability: ${avgScore.toFixed(6)}`);
-  console.log(`✅ Plain text comparison table saved to ${outputFile}`);
+
+  // if (rejectReason) console.log(`Reason: ${rejectReason}`);
+  // console.log(`Average score per vulnerability: ${avgScore.toFixed(6)}`);
+  // console.log(`✅ Plain text comparison table saved to ${outputFile}`);
 
   return { decision, reason: rejectReason, avgScore };
 }
