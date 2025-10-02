@@ -46,11 +46,37 @@ jobs:
           echo "=== snyk-report.json status ==="
           ls -l snyk-report.json || echo "No snyk-report.json created"
 
+      - name: Determine Operation Mode
+        id: determine_mode
+        run: |
+          # Default mode if no tag is found
+          MODE="loose"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BODY="${{ github.event.pull_request.body }}"
+
+          # Combine title and body and use grep/regex to find a tag like [mode:strict]
+          # The regex finds 'loose', 'strict', or 'custom' inside [mode:...]
+          MATCH=$(echo "$PR_TITLE$PR_BODY" | grep -oP '\[mode:\K(loose|strict|custom)(?=\])' | head -1)
+
+          if [ ! -z "$MATCH" ]; then
+              MODE="$MATCH"
+          fi
+          
+          echo "Selected Mode: $MODE"
+          # Set the mode as a step output for use in subsequent steps
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+
       - name: Run Code Reviewer
         if: success() && hashFiles('snyk-report.json') != ''
         id: runreview
         run: |
-          output=$(node code-reviewer/cli.js --path .)
+          # Retrieve the determined mode from the previous step's output
+          MODE="${{ steps.determine_mode.outputs.mode }}"
+          
+          # Pass the mode to your CLI script as an argument
+          output=$(node code-reviewer/cli.js --path . --mode $MODE)
+          
+          # Set the output for the PR comment step
           echo "content<<EOF" >> $GITHUB_OUTPUT
           echo "$output" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
