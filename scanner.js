@@ -1,7 +1,70 @@
 // scanner.js
 import fs from 'fs';
-import fetch from 'node-fetch'; // Node 18+ has global fetch, remove if not needed
+// import fetch from 'node-fetch'; // Node 18+ has global fetch, remove if not needed
 import path from 'path';
+
+// --- Safe JSON reader to handle UTF-8 + BOM + CRLF issues ---
+function readJsonFile(filePath) {
+  const buffer = fs.readFileSync(filePath);
+
+  let content;
+  // Check for UTF-16 LE BOM
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) {
+    content = buffer.toString('utf16le');
+  }
+  // Check for UTF-16 BE BOM
+  else if (buffer[0] === 0xfe && buffer[1] === 0xff) {
+    content = buffer.toString('utf16be');
+  }
+  // Check for UTF-8 BOM
+  else if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    content = buffer.toString('utf8').substring(1); // Remove BOM
+  }
+  // Default to UTF-8
+  else {
+    content = buffer.toString('utf8');
+  }
+
+  // Clean up the content
+  content = content
+    .replace(/^\uFEFF/, '') // Remove BOM if present
+    .replace(/\r\n/g, '\n') // Normalize line endings
+    .replace(/\r/g, '\n')   // Convert remaining \r to \n
+    .trim();                // Remove leading/trailing whitespace
+
+  // Additional cleanup for common JSON issues
+  content = content
+    .replace(/,(\s*[}\]])/g, '$1') // Remove trailing commas
+    .replace(/[\x00-\x1F\x7F-\x9F]/g, ''); // Remove control characters
+
+  try {
+    return JSON.parse(content);
+  } catch (error) {
+    console.error(`❌ JSON parsing error in ${filePath}:`);
+    console.error(`Error: ${error.message}`);
+
+    // Show first few characters for debugging
+    const preview = content.substring(0, 200).replace(/\n/g, '\\n');
+    console.error(`Content preview: "${preview}..."`);
+
+    // Try to identify the issue
+    if (content.includes('\0')) {
+      console.error('⚠️  File contains null bytes, possible binary/encoding issue');
+    }
+    if (!content.startsWith('{') && !content.startsWith('[')) {
+      console.error('⚠️  File doesn\'t start with { or [, might not be JSON');
+    }
+
+    throw new Error(`Invalid JSON in ${filePath}: ${error.message}`);
+  }
+}
+
+// --- Safe UTF-8 JSON writer ---
+function writeJsonFile(filePath, data) {
+  const jsonString = JSON.stringify(data, null, 2);
+  // Explicitly specify UTF-8 encoding
+  fs.writeFileSync(filePath, jsonString, { encoding: 'utf8' });
+}
 
 // --- Exported function for CLI ---
 export async function runScanner(projectPath = ".") {
@@ -11,7 +74,7 @@ export async function runScanner(projectPath = ".") {
     throw new Error(`Could not find snyk-report.json in ${projectPath}`);
   }
 
-  const report = JSON.parse(fs.readFileSync(snykFile, "utf8"));
+  const report = readJsonFile(snykFile);
   const vulnerabilities = report.vulnerabilities || [];
   if (!Array.isArray(vulnerabilities)) {
     throw new Error("Expected snyk-report.json to contain vulnerabilities array.");
@@ -23,6 +86,7 @@ export async function runScanner(projectPath = ".") {
 
   // Prepare text report
   const outputFile = path.join(projectPath, "epss-report.txt");
+
   let reportContent = '';
 
   // Fetch EPSS for each CVE
@@ -49,7 +113,7 @@ export async function runScanner(projectPath = ".") {
     if (score >= 4.0) return "medium";
     return "low";
   }
-
+  // console.log("vulnerabilities", vulnerabilities);
   for (const vuln of vulnerabilities) {
     const cves = vuln.identifiers?.CVE || [];
     const cvssScore = vuln.cvssSources?.[0]?.baseScore || null;
@@ -57,21 +121,20 @@ export async function runScanner(projectPath = ".") {
     // If no CVE → still try EPSS (will fail gracefully) then fallback to CVSS
     const targets = cves.length > 0 ? cves : [null];
 
-
-
     for (const cve of targets) {
       if (cve && seenCVEs.has(cve)) continue;
       if (cve) seenCVEs.add(cve);
       totalVulnerabilities++;
 
       const epssData = await fetchEPSS(cve);
-
+      // console.log("epssData", epssData);
       if (epssData) {
         reportContent += `
         Vulnerability: ${vuln.title}
         Package: ${vuln.moduleName} (${vuln.version})
         CVE: ${cve || "N/A"}
         EPSS Score (Probability): ${epssData.epss}
+        CVSS Score: ${vuln.cvssScore}
         Percentile: ${epssData.percentile}
         🔗 ${vuln.references[0]?.url || 'No reference'}
         ------------------------------------------------
@@ -81,9 +144,9 @@ export async function runScanner(projectPath = ".") {
           moduleName: vuln.moduleName,
           title: vuln.title,
           cve,
-          epss: epssData.epss,
-          percentile: epssData.percentile,
-          cvss: null, // ignore CVSS since EPSS is available
+          epss: epssData?.epss || null,
+          percentile: epssData?.percentile || null,
+          cvss: vuln.cvssScore, // ignore CVSS since EPSS is available
           severity: null,
           references: vuln.references || [],
           metric: "EPSS"
@@ -117,7 +180,6 @@ export async function runScanner(projectPath = ".") {
     }
   }
 
-
   // Summary
   // const summary = `\n🔴 Total vulnerabilities found: ${totalVulnerabilities}\n`;
   // console.log(summary);
@@ -134,15 +196,22 @@ export async function runScanner(projectPath = ".") {
   console.log(severitySummary);
   reportContent += severitySummary;
 
+  // Write text report (explicitly UTF-8)
+  // fs.writeFileSync(outputFile, reportContent, { encoding: 'utf8' });
+  // console.log(`✅ EPSS report saved to ${outputFile}`);
 
-  // Write text report
-  fs.writeFileSync(outputFile, reportContent, 'utf8');
-  console.log(`✅ EPSS report saved to ${outputFile}`);
-
-  // Return JSON for CLI
-  return {
+  // Create the final result object
+  const finalResult = {
     totalVulnerabilities: result.length,
     vulnerabilities: result,
-    severityCounts
+    severityCounts,
+    reportFile: outputFile,
   };
+
+  // Write JSON report in UTF-8
+  // writeJsonFile(jsonOutputFile, finalResult);
+  // console.log(`✅ JSON report saved to ${jsonOutputFile} (UTF-8 encoding)`);
+
+  // Return JSON for CLI
+  return finalResult;
 }
