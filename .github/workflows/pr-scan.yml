@@ -120,3 +120,11 @@ jobs:
           #   statuses: write      # <--- ADD THIS to the permissions block if needed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - name: Upload Snyk Code Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code-review-report
+          path: code-reviewer/snyk-code-report.txt
