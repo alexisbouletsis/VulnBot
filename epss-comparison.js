@@ -177,35 +177,55 @@ export function runComparison(
   const avgScore = count > 0 ? totalScore / count : 0;
   let decision = "ACCEPT";
   let rejectReason = "";
+  // console.log("rows", rows);
+  // console.log("rows[0]", rows[0]);
 
-  for (const row of rows) {
-    const vulnScore = parseFloat(row[5]);   // Vulnerability Score
-    const epssScore = parseFloat(row[4]);   // EPSS Score column
-    const cvssScore = parseFloat(row[6]);   // CVSS column (may be "-")
+  // for (const row of rows) {
+  //   const vulnScore = parseFloat(row[5]);   // Vulnerability Score
+  //   const epssScore = parseFloat(row[4]);   // EPSS Score column
+  //   const cvssScore = parseFloat(row[6]);   // CVSS column (may be "-")
+  //   console.log("vulnScore", vulnScore);
+  //   // Rule 1: Critical vulnerability score
+  //   if (vulnScore > config.thresholds.criticalThreshold) {
+  //     decision = "REJECT";
+  //     rejectReason = `High Vulnerability Score (combined metric) on CVE: ${row[0]}`;
+  //     break;
+  //   }
 
-    // Rule 1: Critical vulnerability score
-    if (vulnScore > config.thresholds.criticalThreshold) {
-      decision = "REJECT";
-      rejectReason = `High Vulnerability Score (combined metric) on CVE: ${row[0]}`;
-      break;
-    }
-
-    // Rule 2: EPSS + CVSS cutoff
-    if (
-      vulnScore > config.thresholds.avgThreshold &&
-      cvssScore > config.thresholds.cvssCutoff
-    ) {
-      decision = "REJECT";
-      rejectReason = `EPSS (${vulnScore}) and CVSS (${cvssScore}) too high for CVE: ${row[0]}`;
-      break;
-    }
-  }
+  //   // Rule 2: EPSS + CVSS cutoff
+  //   if (
+  //     vulnScore > config.thresholds.avgThreshold &&
+  //     cvssScore > config.thresholds.cvssCutoff
+  //   ) {
+  //     decision = "REJECT";
+  //     rejectReason = `EPSS (${vulnScore}) and CVSS (${cvssScore}) too high for CVE: ${row[0]}`;
+  //     break;
+  //   }
+  // }
 
   // Rule 3: Average EPSS threshold
-  if (decision === "ACCEPT" && avgScore > config.thresholds.avgThreshold) {
-    decision = "REJECT";
-    rejectReason = `Average EPSS too high (${avgScore.toFixed(6)})`;
+  // if (decision === "ACCEPT" && avgScore > config.thresholds.avgThreshold) {
+  //   decision = "REJECT";
+  //   rejectReason = `Average EPSS too high (${avgScore.toFixed(6)})`;
+  // }
+
+  // 4. Reject if any severity exceeds threshold
+  if (decision === "ACCEPT") {
+    const counts = scannerData.severityCounts || {};
+    const thresholds = config.thresholds.severityCounts || {};
+
+    for (const sev of ['critical', 'high', 'medium', 'low']) {
+      const count = counts[sev] || 0;
+      const maxAllowed = thresholds[sev];
+
+      if (maxAllowed !== null && maxAllowed !== undefined && count > maxAllowed) {
+        decision = "REJECT";
+        rejectReason = `Too many ${sev.toUpperCase()} vulnerabilities: ${count} (max allowed ${maxAllowed})`;
+        break;  // stop at first violation
+      }
+    }
   }
+
 
 
   let reportContent = `Digital PR Code Review Report
@@ -228,16 +248,16 @@ export function runComparison(
   reportContent += "\n\n" + table;
 
   // Write to file with explicit UTF-8 encoding
-  // if (finalReport) {
-  //   fs.writeFileSync(finalReport, reportContent, { encoding: 'utf-8' });
-  //   console.log(`✅ Digital PR report saved to ${finalReport}`);
-  // }
+  if (finalReport) {
+    fs.writeFileSync(finalReport, reportContent, { encoding: 'utf-8' });
+    console.log(`✅ Digital PR report saved to ${finalReport}`);
+  }
 
   // --- Write table to file with explicit UTF-8 encoding ---
-  // if (outputFile) {
-  //   fs.writeFileSync(outputFile, table, { encoding: 'utf-8' });
-  //   console.log(`✅ Plain text comparison table saved to ${outputFile}`);
-  // }
+  if (outputFile) {
+    fs.writeFileSync(outputFile, table, { encoding: 'utf-8' });
+    console.log(`✅ Plain text comparison table saved to ${outputFile}`);
+  }
 
   return { decision, reason: rejectReason, avgScore, table };
 }
