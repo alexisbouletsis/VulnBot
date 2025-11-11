@@ -29,11 +29,10 @@ if (fs.existsSync(CONFIG_FILE)) {
       avgThreshold: 0.055,
       criticalThreshold: 0.3,
       cvssCutoff: 7,
-      severityCounts: {
-        critical: 1,
-        high: 2,
+      codeSeverityCounts: {
+        high: 1,
         medium: 5,
-        low: null
+        low: 10
       }
     }
   };
@@ -54,9 +53,15 @@ async function main() {
     ]
   });
 
-  if (choice === 'Configure thresholds & weights') await configure();
-  else if (choice === 'Run PR scan') await runReview();
-  else process.exit();
+  if (choice === 'Configure thresholds & weights') {
+    await configure();
+    return main();
+  }
+  else if (choice === 'Run PR scan') {
+    await runReview();
+    process.exit(0);
+  }
+  else { process.exit(); }
 }
 
 // --- Configure thresholds & weights ---
@@ -84,14 +89,14 @@ async function configure(modeOverride = null) {
     config.thresholds.avgThreshold = 0.0001;
     config.thresholds.criticalThreshold = 0.0001;
     config.thresholds.cvssCutoff = 1;
-    config.thresholds.severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
+    config.thresholds.codeSeverityCounts = {high: 0, medium: 5, low: 10 };
     console.log(chalk.red("Strict mode enabled, system will be very conservative."));
 
   } else if (normalizedMode === 'loose') {
     config.thresholds.avgThreshold = 1.0;
     config.thresholds.criticalThreshold = 1.0;
     config.thresholds.cvssCutoff = 10;
-    config.thresholds.severityCounts = { critical: 2, high: 3, medium: 5, low: null };
+    config.thresholds.codeSeverityCounts = {high: 5, medium: 10, low: null };
     console.log(chalk.yellow("Loose mode enabled, system will be more permissive."));
 
   } else if (normalizedMode === 'custom') {
@@ -100,7 +105,7 @@ async function configure(modeOverride = null) {
       // config.thresholds.avgThreshold = parseFloat(process.env.AVG_THRESHOLD) || 0.05;
       // config.thresholds.criticalThreshold = parseFloat(process.env.CRITICAL_THRESHOLD) || 0.3;
       // config.thresholds.cvssCutoff = parseFloat(process.env.CVSS_CUTOFF) || 7;
-      console.log(chalk.cyan(`Custom mode loaded from environment variables.`));
+      console.log(chalk.cyan("Custom mode running. Using thresholds loaded from config.json."));
     } else {
       // Interactive Custom: prompt for manual configuration
       const answers = await inquirer.prompt([
@@ -114,10 +119,9 @@ async function configure(modeOverride = null) {
         { type: 'input', name: 'epssCutoff', message: 'EPSS cutoff (0-1):', default: config.thresholds.avgThreshold },
         { type: 'input', name: 'epssCritical', message: 'EPSS Critical (0-1):', default: config.thresholds.criticalThreshold },
         { type: 'input', name: 'cvssCutoff', message: 'CVSS cutoff (0-10):', default: config.thresholds.cvssCutoff },
-        { type: 'input', name: 'nOfCriticals', message: 'Count of critical severities', default: config.thresholds.severityCounts.critical },
-        { type: 'input', name: 'nOfHighs', message: 'Count of high severities', default: config.thresholds.severityCounts.high },
-        { type: 'input', name: 'nOfMediums', message: 'Count of medium severities', default: config.thresholds.severityCounts.medium },
-        { type: 'input', name: 'nOfLows', message: 'Count of low severities', default: config.thresholds.severityCounts.low },
+        { type: 'input', name: 'nOfHighs', message: 'Count of high severities', default: config.thresholds.codeSeverityCounts.high },
+        { type: 'input', name: 'nOfMediums', message: 'Count of medium severities', default: config.thresholds.codeSeverityCounts.medium },
+        { type: 'input', name: 'nOfLows', message: 'Count of low severities', default: config.thresholds.codeSeverityCounts.low },
       ]);
 
       // Update config from custom answers
@@ -127,18 +131,17 @@ async function configure(modeOverride = null) {
       config.thresholds.avgThreshold = parseFloat(answers.epssCutoff);
       config.thresholds.criticalThreshold = parseFloat(answers.epssCritical);
       config.thresholds.cvssCutoff = parseFloat(answers.cvssCutoff);
-      config.thresholds.severityCounts.critical = parseFloat(answers.nOfCriticals);
-      config.thresholds.severityCounts.high = parseFloat(answers.nOfHighs);
-      config.thresholds.severityCounts.medium = parseFloat(answers.nOfMediums);
-      config.thresholds.severityCounts.low = parseFloat(answers.nOfLows);
+      config.thresholds.codeSeverityCounts.critical = parseFloat(answers.nOfCriticals);
+      config.thresholds.codeSeverityCounts.high = parseFloat(answers.nOfHighs);
+      config.thresholds.codeSeverityCounts.medium = parseFloat(answers.nOfMediums);
+      config.thresholds.codeSeverityCounts.low = parseFloat(answers.nOfLows);
     }
   }
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
   console.log(chalk.green("✅ Configuration saved!"));
 
-  // Only loop back to main menu if it was an interactive configuration
-  if (!isCI && !modeOverride) main();
+  return;
 }
 
 
@@ -150,9 +153,10 @@ async function runReview() {
     default: '.'
   })).path;
 
+
   console.log(chalk.yellow("Running scanner..."));
   const scanResult = await runScanner(path);
-
+  //console.log("scanResult",scanResult);
   console.log(chalk.yellow("Comparing vulnerabilities..."));
   const { decision, reason, avgScore } = runComparison(
     "snyk-report.json",
@@ -167,9 +171,8 @@ async function runReview() {
   console.log(`PR Decision: ${decision === 'REJECT' ? chalk.red(decision) : chalk.green(decision)}`);
   if (reason) console.log(`Reason: ${chalk.red(reason)}`);
   console.log(`Average Vulnerability Score: ${avgScore.toFixed(6)}`);
-  // console.log(chalk.green("✅ Digital PR report saved to final-report.txt"));
-  // console.log(chalk.green("✅ Plain text comparison table saved to epss-plain-table.txt"));
-  console.log("avgThreshold", config.thresholds.avgThreshold);
+  console.log(chalk.green("✅ Digital PR report saved to final-report.txt"));
+  console.log(chalk.green("✅ Plain text comparison table saved to epss-plain-table.txt"));
 }
 
 // --- Entry ---
