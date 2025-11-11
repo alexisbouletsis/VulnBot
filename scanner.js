@@ -1,7 +1,8 @@
 // scanner.js
 import fs from 'fs';
-// import fetch from 'node-fetch'; // Node 18+ has global fetch, remove if not needed
 import path from 'path';
+import { execSync } from "child_process";
+
 
 // --- Safe JSON reader to handle UTF-8 + BOM + CRLF issues ---
 function readJsonFile(filePath) {
@@ -68,10 +69,46 @@ function writeJsonFile(filePath, data) {
 
 // --- Exported function for CLI ---
 export async function runScanner(projectPath = ".") {
+
+  // Ensure output directory exists
+  const outputDir = path.join(projectPath, "code-reviewer");
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+  const snykCodeReportTxt = path.join(outputDir, "snyk-code-report.txt");
+
+  try {
+    // Run Snyk Code Test and capture both stdout and stderr
+    const output = execSync(`snyk code test "${projectPath}"`, { encoding: "utf8" });
+    fs.writeFileSync(snykCodeReportTxt, output, { encoding: "utf8" });
+    console.log(`✅ Snyk code test completed and saved to ${snykCodeReportTxt}`);
+  } catch (error) {
+    // Write even if Snyk fails (it often returns non-zero on vulnerabilities)
+    fs.writeFileSync(snykCodeReportTxt, error.stdout || error.message, { encoding: "utf8" });
+  }
   // Load Snyk report
   const snykFile = path.join(projectPath, "snyk-report.json");
   if (!fs.existsSync(snykFile)) {
     throw new Error(`Could not find snyk-report.json in ${projectPath}`);
+  }
+
+  const codeSeverityCounts = { high: 0, medium: 0, low: 0 };
+
+  if (fs.existsSync(snykCodeReportTxt)) {
+    const txt = fs.readFileSync(snykCodeReportTxt, "utf8");
+
+    // Match example: "Open issues:    13 [ 1 HIGH  8 MEDIUM  4 LOW ]"
+    const match = txt.match(/Open issues:\s*\d+\s*\[\s*(\d+)\s+HIGH\s+(\d+)\s+MEDIUM\s+(\d+)\s+LOW\s*\]/i);
+
+    if (match) {
+      codeSeverityCounts.high = parseInt(match[1], 10);
+      codeSeverityCounts.medium = parseInt(match[2], 10);
+      codeSeverityCounts.low = parseInt(match[3], 10);
+      console.log("✅ Extracted code severity counts from snyk-code-report.txt:", codeSeverityCounts);
+    } else {
+      console.warn("⚠️ Could not find 'Open issues' line in snyk-code-report.txt");
+    }
+  } else {
+    console.warn("⚠️ snyk-code-report.txt not found");
   }
 
   const report = readJsonFile(snykFile);
@@ -85,7 +122,7 @@ export async function runScanner(projectPath = ".") {
   const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
 
   // Prepare text report
-  const outputFile = path.join(projectPath, "epss-report.txt");
+  const outputFile = path.join(projectPath, "epss-report.txt"); 
 
   let reportContent = '';
 
@@ -117,8 +154,6 @@ export async function runScanner(projectPath = ".") {
   for (const vuln of vulnerabilities) {
     const cves = vuln.identifiers?.CVE || [];
     const cvssScore = vuln.cvssSources?.[0]?.baseScore || null;
-
-    // If no CVE → still try EPSS (will fail gracefully) then fallback to CVSS
     const targets = cves.length > 0 ? cves : [null];
 
     for (const cve of targets) {
@@ -127,58 +162,62 @@ export async function runScanner(projectPath = ".") {
       totalVulnerabilities++;
 
       const epssData = await fetchEPSS(cve);
-      // console.log("epssData", epssData);
-      if (epssData) {
-        reportContent += `
-        Vulnerability: ${vuln.title}
-        Package: ${vuln.moduleName} (${vuln.version})
-        CVE: ${cve || "N/A"}
-        EPSS Score (Probability): ${epssData.epss}
-        CVSS Score: ${vuln.cvssScore}
-        Percentile: ${epssData.percentile}
-        🔗 ${vuln.references[0]?.url || 'No reference'}
-        ------------------------------------------------
-        `;
 
-        result.push({
-          moduleName: vuln.moduleName,
-          title: vuln.title,
-          cve,
-          epss: epssData?.epss || null,
-          percentile: epssData?.percentile || null,
-          cvss: vuln.cvssScore, // ignore CVSS since EPSS is available
-          severity: null,
-          references: vuln.references || [],
-          metric: "EPSS"
-        });
+      let severity;
+      let metricUsed;
+      let epssScore = epssData ? parseFloat(epssData.epss) : null;
+
+      if (epssScore !== null && !isNaN(epssScore)) {
+        // --- EPSS-based classification ---
+        if (epssScore >= 0.5) severity = "critical";
+        else if (epssScore >= 0.3) severity = "high";
+        else if (epssScore >= 0.1) severity = "medium";
+        else severity = "low";
+        metricUsed = "EPSS";
       } else {
-        // No EPSS → fallback to CVSS
-        const severity = classifyCVSS(cvssScore);
-        if (severity) severityCounts[severity]++;
-
-        reportContent += `
-        ⚠️  No EPSS found for ${cve || vuln.moduleName}, fallback to CVSS
-        Package: ${vuln.moduleName} (${vuln.version})
-        CVE: ${cve || "N/A"}
-        CVSS Score: ${cvssScore || "N/A"} → Severity: ${severity || "N/A"}
-        🔗 ${vuln.references[0]?.url || 'No reference'}
-        ------------------------------------------------
-        `;
-
-        result.push({
-          moduleName: vuln.moduleName,
-          title: vuln.title,
-          cve,
-          epss: null,
-          percentile: null,
-          cvss: cvssScore,
-          severity,
-          references: vuln.references || [],
-          metric: "CVSS"
-        });
+        // --- CVSS fallback ---
+        severity = classifyCVSS(cvssScore);
+        metricUsed = "CVSS";
       }
+
+      if (severity) severityCounts[severity]++;
+
+      // --- Report text formatting ---
+      if (metricUsed === "EPSS") {
+        reportContent += `
+✗ [${severity.toUpperCase()}] ${vuln.title}
+   Package: ${vuln.moduleName} (${vuln.version})
+   CVE: ${cve || "N/A"}
+   EPSS Score: ${epssData.epss} | Percentile: ${epssData.percentile}
+   CVSS Score: ${vuln.cvssScore || "N/A"}
+   🔗 ${vuln.references[0]?.url || "No reference"}
+   ------------------------------------------------
+`;
+      } else {
+        reportContent += `
+✗ [${severity.toUpperCase()}] ${vuln.title}
+   Package: ${vuln.moduleName} (${vuln.version})
+   CVE: ${cve || "N/A"}
+   CVSS Score: ${cvssScore || "N/A"} → Severity: ${severity}
+   🔗 ${vuln.references[0]?.url || "No reference"}
+   ------------------------------------------------
+`;
+      }
+
+      result.push({
+        moduleName: vuln.moduleName,
+        title: vuln.title,
+        cve,
+        epss: epssData?.epss || null,
+        percentile: epssData?.percentile || null,
+        cvss: cvssScore,
+        severity,
+        references: vuln.references || [],
+        metric: metricUsed,
+      });
     }
   }
+
 
   // Summary
   // const summary = `\n🔴 Total vulnerabilities found: ${totalVulnerabilities}\n`;
@@ -187,7 +226,7 @@ export async function runScanner(projectPath = ".") {
 
   // Severity summary
   const severitySummary = `
-  Severity counts (CVSS fallback):
+  Severity counts (CVSS fallback) dependencies:
     Critical: ${severityCounts.critical}
     High:     ${severityCounts.high}
     Medium:   ${severityCounts.medium}
@@ -197,16 +236,19 @@ export async function runScanner(projectPath = ".") {
   reportContent += severitySummary;
 
   // Write text report (explicitly UTF-8)
-  // fs.writeFileSync(outputFile, reportContent, { encoding: 'utf8' });
-  // console.log(`✅ EPSS report saved to ${outputFile}`);
+  fs.writeFileSync(outputFile, reportContent, { encoding: 'utf8' });
+  console.log(`✅ EPSS report saved to ${outputFile}`);
 
   // Create the final result object
   const finalResult = {
     totalVulnerabilities: result.length,
     vulnerabilities: result,
-    severityCounts,
+    codeSeverityCounts,
     reportFile: outputFile,
   };
+
+    // console.log("finalResult",finalResult);
+
 
   // Write JSON report in UTF-8
   // writeJsonFile(jsonOutputFile, finalResult);
