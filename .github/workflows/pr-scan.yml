@@ -5,8 +5,9 @@ on:
     types: [opened, synchronize]
 
 permissions:
-  contents: read        # needed for checkout
-  pull-requests: write  # needed to comment on PR
+  contents: read       # Needed for checkout
+  pull-requests: write # Needed to comment on PR
+  # statuses: write     # Uncomment if you want to mark PR as failing when rejected
 
 jobs:
   review:
@@ -43,40 +44,33 @@ jobs:
       - name: Run Snyk scan
         run: |
           snyk test --json > snyk-report.json || echo "Snyk scan failed"
-          echo "=== snyk-report.json status ==="
-          ls -l snyk-report.json || echo "No snyk-report.json created"
+          snyk code test . > code-reviewer/snyk-code-report.txt || echo "Snyk Code test failed"
+          echo "=== snyk-code-report.txt content preview ==="
+          head -n 20 code-reviewer/snyk-code-report.txt
 
       - name: Determine Operation Mode
         id: determine_mode
         run: |
-          # Default mode if no tag is found
           MODE="loose"
           PR_TITLE="${{ github.event.pull_request.title }}"
           PR_BODY="${{ github.event.pull_request.body }}"
 
-          # Combine title and body and use grep/regex to find a tag like [mode:strict]
-          # The regex finds 'loose', 'strict', or 'custom' inside [mode:...]
           MATCH=$(echo "$PR_TITLE$PR_BODY" | grep -oP '\[mode:\K(loose|strict|custom)(?=\])' | head -1)
 
-          if [ ! -z "$MATCH" ]; then
+          if [ -n "$MATCH" ]; then
               MODE="$MATCH"
           fi
           
           echo "Selected Mode: $MODE"
-          # Set the mode as a step output for use in subsequent steps
           echo "mode=$MODE" >> $GITHUB_OUTPUT
 
       - name: Run Code Reviewer
         if: success() && hashFiles('snyk-report.json') != ''
         id: runreview
         run: |
-          # Retrieve the determined mode from the previous step's output
           MODE="${{ steps.determine_mode.outputs.mode }}"
-          
-          # Pass the mode to your CLI script as an argument
           output=$(node code-reviewer/cli.js --path . --mode $MODE)
           
-          # Set the output for the PR comment step
           echo "content<<EOF" >> $GITHUB_OUTPUT
           echo "$output" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -91,13 +85,13 @@ jobs:
       - name: Comment on PR
         if: success() && hashFiles('snyk-report.json') != ''
         uses: actions/github-script@v7
-        id: pr_status_check  # <--- Give this step an ID for status checks
+        id: pr_status_check
         with:
           script: |
             const message = `${{ steps.runreview.outputs.content }}`;
             const decision = message.includes("PR Decision: REJECT") ? "REJECT" : "APPROVE";
-            
-            // 1. Post the comment (as you already do)
+
+            // Post the comment
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -105,26 +99,38 @@ jobs:
               body: message
             });
 
-            // 2. Set the result and fail the job if rejected
+            // Fail the job if the PR is rejected
             if (decision === "REJECT") {
-              console.log("::error::The code review decision is REJECT. Merge blocked by security policy.");
-              // This is the key: set the status check to failure
               core.setFailed("PR failed automated code review.");
             }
-          
-          # NOTE: You must use the `actions/github-script` with the `core` library
-          # To use core.setFailed, you must grant write access to the action:
-          # permissions:
-          #   contents: read
-          #   pull-requests: write # This is already set
-          #   statuses: write      # <--- ADD THIS to the permissions block if needed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 
       - name: Upload Snyk Code Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: snyk-code-review-report
+          name: snyk-code-report
           path: code-reviewer/snyk-code-report.txt
+
+      - name: Comment with Snyk Code Report link
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runId = process.env.GITHUB_RUN_ID;
+            const repoUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+            const artifactName = "snyk-code-report";
+            
+            const message = [
+              '📄 **Snyk Code Report Available**',
+              'You can download the latest report from the workflow artifacts:',
+              `👉 [Click here to view and download reports](${repoUrl})`
+            ].join('\n'); // Join with a newline character
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: message
+            });
